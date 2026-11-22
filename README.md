@@ -12,15 +12,17 @@ Node.js 24 backend testing project.
 
 npm install
 
-## Run backend
+## Run
 
 npm start
 
-## Run tests
+## Test
 
 npm test
 
-## Health endpoint
+## API
+
+GET /
 
 GET /health
 
@@ -28,8 +30,3 @@ GET /health
 
 Workflow:
 .github/workflows/test.yml
-
-Supports:
-- Automatic push testing
-- Pull request testing
-- Manual workflow dispatch
