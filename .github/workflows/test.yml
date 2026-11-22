@@ -1,5 +1,5 @@
 
-name: FF Private Server - Test
+name: FF Private Server CI
 
 on:
   workflow_dispatch:
@@ -16,7 +16,18 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify repository
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+          pwd
+          ls -la
+          test -f package.json
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -30,7 +41,7 @@ jobs:
         run: npm --version
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts --no-audit --no-fund
 
-      - name: Run tests
+      - name: Run backend tests
         run: npm test
