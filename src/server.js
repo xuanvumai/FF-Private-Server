@@ -8,6 +8,7 @@ function createServer() {
     const accounts = new Map();
     const sessions = new Map();
     const queue = new Map();
+    const rooms = new Map();
     const matches = new Map();
 
     function send(res, status, data) {
@@ -20,9 +21,11 @@ function createServer() {
 
     async function readBody(req) {
         let raw = '';
+
         for await (const chunk of req) {
-            raw += chunk;
-            if (raw.length > 8192) {
+            raw += chunk.toString();
+
+            if (Buffer.byteLength(raw) > 8192) {
                 throw new Error('BODY_TOO_LARGE');
             }
         }
@@ -38,11 +41,15 @@ function createServer() {
 
     function getUser(req) {
         const header = req.headers.authorization || '';
-        const token = header.startsWith('Bearer ')
-            ? header.slice(7)
-            : '';
 
-        return sessions.get(token) || null;
+        if (!header.startsWith('Bearer ')) return null;
+
+        return sessions.get(header.slice(7)) || null;
+    }
+
+    function hashPassword(password, salt) {
+        return crypto.scryptSync(password, salt, 64)
+            .toString('hex');
     }
 
     function createSession(username) {
@@ -51,55 +58,48 @@ function createServer() {
         return token;
     }
 
-    function hashPassword(password, salt) {
-        return crypto.scryptSync(password, salt, 64)
-            .toString('hex');
-    }
+    function makeMatch(players, roomId = null) {
+        const match = {
+            id: crypto.randomUUID(),
+            roomId,
+            players,
+            status: 'started',
+            winner: null,
+            createdAt: new Date().toISOString(),
+            finishedAt: null
+        };
 
-    function verifyPassword(password, account) {
-        const actual = Buffer.from(
-            hashPassword(password, account.salt),
-            'hex'
-        );
-
-        const expected = Buffer.from(account.passwordHash, 'hex');
-
-        return crypto.timingSafeEqual(actual, expected);
+        matches.set(match.id, match);
+        return match;
     }
 
     const app = http.createServer(async (req, res) => {
-        const url = new URL(
-            req.url,
-            'http://localhost'
-        );
-
+        const url = new URL(req.url, 'http://localhost');
         const path = url.pathname;
         const method = req.method;
 
         try {
-            // SERVER STATUS
+            // HEALTH
             if (method === 'GET' && path === '/health') {
                 return send(res, 200, {
                     status: 'online',
-                    version: '2.0.0',
+                    version: '3.0.0',
                     node: process.version,
                     modules: [
                         'account',
                         'lobby',
-                        'matchmaking'
+                        'matchmaking',
+                        'rooms',
+                        'matches'
                     ]
                 });
             }
 
-            // ACCOUNT REGISTER
+            // REGISTER
             if (method === 'POST' && path === '/api/register') {
                 const body = await readBody(req);
-
                 const username = String(body.username || '')
-                    .trim()
-                    .toLowerCase();
-
-                const password = body.password;
+                    .trim().toLowerCase();
 
                 if (!/^[a-z0-9_]{3,20}$/.test(username)) {
                     return send(res, 400, {
@@ -108,9 +108,9 @@ function createServer() {
                 }
 
                 if (
-                    typeof password !== 'string' ||
-                    password.length < 8 ||
-                    password.length > 128
+                    typeof body.password !== 'string' ||
+                    body.password.length < 8 ||
+                    body.password.length > 128
                 ) {
                     return send(res, 400, {
                         error: 'INVALID_PASSWORD'
@@ -128,49 +128,58 @@ function createServer() {
                 accounts.set(username, {
                     username,
                     salt,
-                    passwordHash: hashPassword(password, salt),
+                    passwordHash: hashPassword(body.password, salt),
                     createdAt: new Date().toISOString()
                 });
 
-                const token = createSession(username);
-
                 return send(res, 201, {
                     message: 'ACCOUNT_CREATED',
-                    token,
+                    token: createSession(username),
                     user: { username }
                 });
             }
 
-            // ACCOUNT LOGIN
+            // LOGIN
             if (method === 'POST' && path === '/api/login') {
                 const body = await readBody(req);
-
                 const username = String(body.username || '')
-                    .trim()
-                    .toLowerCase();
+                    .trim().toLowerCase();
 
                 const account = accounts.get(username);
 
                 if (
                     !account ||
-                    typeof body.password !== 'string' ||
-                    !verifyPassword(body.password, account)
+                    typeof body.password !== 'string'
                 ) {
                     return send(res, 401, {
                         error: 'INVALID_CREDENTIALS'
                     });
                 }
 
-                const token = createSession(username);
+                const actual = Buffer.from(
+                    hashPassword(body.password, account.salt),
+                    'hex'
+                );
+
+                const expected = Buffer.from(
+                    account.passwordHash,
+                    'hex'
+                );
+
+                if (!crypto.timingSafeEqual(actual, expected)) {
+                    return send(res, 401, {
+                        error: 'INVALID_CREDENTIALS'
+                    });
+                }
 
                 return send(res, 200, {
                     message: 'LOGIN_SUCCESS',
-                    token,
+                    token: createSession(username),
                     user: { username }
                 });
             }
 
-            // AUTHENTICATED ROUTES
+            // AUTHENTICATION
             const username = getUser(req);
 
             if (!username) {
@@ -179,7 +188,7 @@ function createServer() {
                 });
             }
 
-            // ACCOUNT PROFILE
+            // PROFILE
             if (method === 'GET' && path === '/api/me') {
                 const account = accounts.get(username);
 
@@ -195,6 +204,16 @@ function createServer() {
 
                 sessions.delete(token);
                 queue.delete(username);
+
+                for (const room of rooms.values()) {
+                    room.players = room.players.filter(
+                        player => player !== username
+                    );
+
+                    if (room.host === username) {
+                        room.status = 'closed';
+                    }
+                }
 
                 return send(res, 200, {
                     message: 'LOGOUT_SUCCESS'
@@ -213,18 +232,166 @@ function createServer() {
                 });
             }
 
-            // MATCHMAKING JOIN
-            if (method === 'POST' && path === '/api/matchmaking/join') {
-                const existingMatch = [...matches.values()]
-                    .find(match => match.players.includes(username));
+            // CREATE ROOM
+            if (method === 'POST' && path === '/api/rooms') {
+                const body = await readBody(req);
+                const name = String(body.name || '').trim();
+                const maxPlayers = Number(body.maxPlayers || 2);
 
-                if (existingMatch) {
-                    return send(res, 200, {
-                        status: 'matched',
-                        match: existingMatch
+                if (name.length < 3 || name.length > 30) {
+                    return send(res, 400, {
+                        error: 'INVALID_ROOM_NAME'
                     });
                 }
 
+                if (
+                    !Number.isInteger(maxPlayers) ||
+                    maxPlayers < 2 ||
+                    maxPlayers > 4
+                ) {
+                    return send(res, 400, {
+                        error: 'INVALID_PLAYER_LIMIT'
+                    });
+                }
+
+                const room = {
+                    id: crypto.randomUUID(),
+                    name,
+                    host: username,
+                    players: [username],
+                    maxPlayers,
+                    status: 'waiting',
+                    createdAt: new Date().toISOString(),
+                    matchId: null
+                };
+
+                rooms.set(room.id, room);
+
+                return send(res, 201, {
+                    message: 'ROOM_CREATED',
+                    room
+                });
+            }
+
+            // LIST ROOMS
+            if (method === 'GET' && path === '/api/rooms') {
+                return send(res, 200, {
+                    rooms: [...rooms.values()]
+                        .filter(room => room.status !== 'closed')
+                });
+            }
+
+            // JOIN ROOM
+            const joinRoom = path.match(
+                /^\/api\/rooms\/([a-f0-9-]+)\/join$/
+            );
+
+            if (method === 'POST' && joinRoom) {
+                const room = rooms.get(joinRoom[1]);
+
+                if (!room || room.status === 'closed') {
+                    return send(res, 404, {
+                        error: 'ROOM_NOT_FOUND'
+                    });
+                }
+
+                if (room.status !== 'waiting') {
+                    return send(res, 409, {
+                        error: 'ROOM_ALREADY_STARTED'
+                    });
+                }
+
+                if (room.players.includes(username)) {
+                    return send(res, 200, { room });
+                }
+
+                if (room.players.length >= room.maxPlayers) {
+                    return send(res, 409, {
+                        error: 'ROOM_FULL'
+                    });
+                }
+
+                room.players.push(username);
+
+                return send(res, 200, {
+                    message: 'ROOM_JOINED',
+                    room
+                });
+            }
+
+            // LEAVE ROOM
+            const leaveRoom = path.match(
+                /^\/api\/rooms\/([a-f0-9-]+)\/leave$/
+            );
+
+            if (method === 'POST' && leaveRoom) {
+                const room = rooms.get(leaveRoom[1]);
+
+                if (!room || !room.players.includes(username)) {
+                    return send(res, 404, {
+                        error: 'ROOM_NOT_FOUND'
+                    });
+                }
+
+                if (room.host === username) {
+                    room.status = 'closed';
+                    room.players = [];
+                } else {
+                    room.players = room.players.filter(
+                        player => player !== username
+                    );
+                }
+
+                return send(res, 200, {
+                    message: 'ROOM_LEFT'
+                });
+            }
+
+            // START ROOM MATCH
+            const startRoom = path.match(
+                /^\/api\/rooms\/([a-f0-9-]+)\/start$/
+            );
+
+            if (method === 'POST' && startRoom) {
+                const room = rooms.get(startRoom[1]);
+
+                if (!room || room.status !== 'waiting') {
+                    return send(res, 404, {
+                        error: 'ROOM_NOT_AVAILABLE'
+                    });
+                }
+
+                if (room.host !== username) {
+                    return send(res, 403, {
+                        error: 'HOST_ONLY'
+                    });
+                }
+
+                if (room.players.length < 2) {
+                    return send(res, 409, {
+                        error: 'NOT_ENOUGH_PLAYERS'
+                    });
+                }
+
+                const match = makeMatch(
+                    [...room.players],
+                    room.id
+                );
+
+                room.status = 'started';
+                room.matchId = match.id;
+
+                return send(res, 200, {
+                    message: 'MATCH_STARTED',
+                    match
+                });
+            }
+
+            // MATCHMAKING JOIN
+            if (
+                method === 'POST' &&
+                path === '/api/matchmaking/join'
+            ) {
                 if (queue.has(username)) {
                     return send(res, 200, {
                         status: 'waiting'
@@ -236,18 +403,11 @@ function createServer() {
                 if (queue.size >= 2) {
                     const players = [...queue.keys()].slice(0, 2);
 
-                    const match = {
-                        id: crypto.randomUUID(),
-                        players,
-                        status: 'created',
-                        createdAt: new Date().toISOString()
-                    };
-
-                    matches.set(match.id, match);
-
                     for (const player of players) {
                         queue.delete(player);
                     }
+
+                    const match = makeMatch(players);
 
                     return send(res, 200, {
                         status: 'matched',
@@ -256,8 +416,7 @@ function createServer() {
                 }
 
                 return send(res, 200, {
-                    status: 'waiting',
-                    message: 'WAITING_FOR_PLAYER'
+                    status: 'waiting'
                 });
             }
 
@@ -273,29 +432,58 @@ function createServer() {
                 });
             }
 
-            // MATCH STATUS
-            if (
-                method === 'GET' &&
-                path === '/api/matchmaking/status'
-            ) {
-                const match = [...matches.values()]
-                    .find(item => item.players.includes(username));
+            // MATCH DETAILS
+            const matchRoute = path.match(
+                /^\/api\/matches\/([a-f0-9-]+)$/
+            );
 
-                if (match) {
-                    return send(res, 200, {
-                        status: 'matched',
-                        match
+            if (method === 'GET' && matchRoute) {
+                const match = matches.get(matchRoute[1]);
+
+                if (!match || !match.players.includes(username)) {
+                    return send(res, 404, {
+                        error: 'MATCH_NOT_FOUND'
                     });
                 }
 
-                if (queue.has(username)) {
-                    return send(res, 200, {
-                        status: 'waiting'
+                return send(res, 200, { match });
+            }
+
+            // FINISH MATCH
+            const finishMatch = path.match(
+                /^\/api\/matches\/([a-f0-9-]+)\/finish$/
+            );
+
+            if (method === 'POST' && finishMatch) {
+                const match = matches.get(finishMatch[1]);
+
+                if (!match || !match.players.includes(username)) {
+                    return send(res, 404, {
+                        error: 'MATCH_NOT_FOUND'
                     });
                 }
+
+                if (match.status === 'completed') {
+                    return send(res, 409, {
+                        error: 'MATCH_ALREADY_FINISHED'
+                    });
+                }
+
+                const body = await readBody(req);
+
+                if (!match.players.includes(body.winner)) {
+                    return send(res, 400, {
+                        error: 'INVALID_WINNER'
+                    });
+                }
+
+                match.status = 'completed';
+                match.winner = body.winner;
+                match.finishedAt = new Date().toISOString();
 
                 return send(res, 200, {
-                    status: 'idle'
+                    message: 'MATCH_COMPLETED',
+                    match
                 });
             }
 
@@ -333,7 +521,7 @@ if (require.main === module) {
     const port = Number(process.env.PORT || 3000);
 
     server.listen(port, '0.0.0.0', () => {
-        console.log(`FF Backend v2 listening on ${port}`);
+        console.log(`FF Backend v3 running on port ${port}`);
     });
 }
 
