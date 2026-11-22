@@ -4,39 +4,68 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
+const BODY_LIMIT = 8192;
+const SESSION_BYTES = 32;
+
 function createServer() {
     const accounts = new Map();
     const sessions = new Map();
     const queue = new Map();
+    const matchedPlayers = new Map();
     const rooms = new Map();
     const matches = new Map();
 
     function send(res, status, data) {
+        if (res.destroyed || res.writableEnded) return;
+
         res.writeHead(status, {
             'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': 'no-store'
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff'
         });
+
         res.end(JSON.stringify(data));
     }
 
     async function readBody(req) {
-        let raw = '';
+        const chunks = [];
+        let size = 0;
 
         for await (const chunk of req) {
-            raw += chunk.toString();
+            size += chunk.length;
 
-            if (Buffer.byteLength(raw) > 8192) {
-                throw new Error('BODY_TOO_LARGE');
+            if (size > BODY_LIMIT) {
+                const error = new Error('BODY_TOO_LARGE');
+                error.status = 413;
+                throw error;
             }
+
+            chunks.push(chunk);
         }
 
-        if (!raw) return {};
+        if (size === 0) return {};
+
+        let body;
 
         try {
-            return JSON.parse(raw);
+            body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         } catch {
-            throw new Error('INVALID_JSON');
+            const error = new Error('INVALID_JSON');
+            error.status = 400;
+            throw error;
         }
+
+        if (
+            body === null ||
+            typeof body !== 'object' ||
+            Array.isArray(body)
+        ) {
+            const error = new Error('INVALID_BODY');
+            error.status = 400;
+            throw error;
+        }
+
+        return body;
     }
 
     function getUser(req) {
@@ -44,16 +73,19 @@ function createServer() {
 
         if (!header.startsWith('Bearer ')) return null;
 
-        return sessions.get(header.slice(7)) || null;
+        const token = header.slice(7).trim();
+
+        if (!token) return null;
+
+        return sessions.get(token) || null;
     }
 
     function hashPassword(password, salt) {
-        return crypto.scryptSync(password, salt, 64)
-            .toString('hex');
+        return crypto.scryptSync(password, salt, 64).toString('hex');
     }
 
     function createSession(username) {
-        const token = crypto.randomBytes(32).toString('hex');
+        const token = crypto.randomBytes(SESSION_BYTES).toString('hex');
         sessions.set(token, username);
         return token;
     }
@@ -62,7 +94,7 @@ function createServer() {
         const match = {
             id: crypto.randomUUID(),
             roomId,
-            players,
+            players: [...players],
             status: 'started',
             winner: null,
             createdAt: new Date().toISOString(),
@@ -70,20 +102,42 @@ function createServer() {
         };
 
         matches.set(match.id, match);
+
         return match;
     }
 
+    function removePlayerFromQueue(username) {
+        queue.delete(username);
+        matchedPlayers.delete(username);
+    }
+
     const app = http.createServer(async (req, res) => {
-        const url = new URL(req.url, 'http://localhost');
-        const path = url.pathname;
-        const method = req.method;
+        let path;
 
         try {
+            const url = new URL(
+                req.url || '/',
+                'http://localhost'
+            );
+
+            path = url.pathname;
+
+            const method = req.method || 'GET';
+
+            // ROOT
+            if (method === 'GET' && path === '/') {
+                return send(res, 200, {
+                    name: 'FF Private Backend',
+                    version: '3.1.0',
+                    status: 'online'
+                });
+            }
+
             // HEALTH
             if (method === 'GET' && path === '/health') {
                 return send(res, 200, {
                     status: 'online',
-                    version: '3.0.0',
+                    version: '3.1.0',
                     node: process.version,
                     modules: [
                         'account',
@@ -98,8 +152,10 @@ function createServer() {
             // REGISTER
             if (method === 'POST' && path === '/api/register') {
                 const body = await readBody(req);
+
                 const username = String(body.username || '')
-                    .trim().toLowerCase();
+                    .trim()
+                    .toLowerCase();
 
                 if (!/^[a-z0-9_]{3,20}$/.test(username)) {
                     return send(res, 400, {
@@ -142,14 +198,18 @@ function createServer() {
             // LOGIN
             if (method === 'POST' && path === '/api/login') {
                 const body = await readBody(req);
+
                 const username = String(body.username || '')
-                    .trim().toLowerCase();
+                    .trim()
+                    .toLowerCase();
 
                 const account = accounts.get(username);
 
                 if (
                     !account ||
-                    typeof body.password !== 'string'
+                    typeof body.password !== 'string' ||
+                    body.password.length < 8 ||
+                    body.password.length > 128
                 ) {
                     return send(res, 401, {
                         error: 'INVALID_CREDENTIALS'
@@ -166,7 +226,10 @@ function createServer() {
                     'hex'
                 );
 
-                if (!crypto.timingSafeEqual(actual, expected)) {
+                if (
+                    actual.length !== expected.length ||
+                    !crypto.timingSafeEqual(actual, expected)
+                ) {
                     return send(res, 401, {
                         error: 'INVALID_CREDENTIALS'
                     });
@@ -192,6 +255,12 @@ function createServer() {
             if (method === 'GET' && path === '/api/me') {
                 const account = accounts.get(username);
 
+                if (!account) {
+                    return send(res, 404, {
+                        error: 'ACCOUNT_NOT_FOUND'
+                    });
+                }
+
                 return send(res, 200, {
                     username,
                     createdAt: account.createdAt
@@ -200,18 +269,21 @@ function createServer() {
 
             // LOGOUT
             if (method === 'POST' && path === '/api/logout') {
-                const token = req.headers.authorization.slice(7);
+                const token = req.headers.authorization.slice(7).trim();
 
                 sessions.delete(token);
-                queue.delete(username);
+                removePlayerFromQueue(username);
 
                 for (const room of rooms.values()) {
-                    room.players = room.players.filter(
-                        player => player !== username
-                    );
+                    if (!room.players.includes(username)) continue;
 
                     if (room.host === username) {
                         room.status = 'closed';
+                        room.players = [];
+                    } else {
+                        room.players = room.players.filter(
+                            player => player !== username
+                        );
                     }
                 }
 
@@ -236,7 +308,10 @@ function createServer() {
             if (method === 'POST' && path === '/api/rooms') {
                 const body = await readBody(req);
                 const name = String(body.name || '').trim();
-                const maxPlayers = Number(body.maxPlayers || 2);
+
+                const maxPlayers = body.maxPlayers === undefined
+                    ? 2
+                    : Number(body.maxPlayers);
 
                 if (name.length < 3 || name.length > 30) {
                     return send(res, 400, {
@@ -374,7 +449,7 @@ function createServer() {
                 }
 
                 const match = makeMatch(
-                    [...room.players],
+                    room.players,
                     room.id
                 );
 
@@ -392,6 +467,24 @@ function createServer() {
                 method === 'POST' &&
                 path === '/api/matchmaking/join'
             ) {
+                const existingMatchId = matchedPlayers.get(username);
+
+                if (existingMatchId) {
+                    const existingMatch = matches.get(existingMatchId);
+
+                    if (
+                        existingMatch &&
+                        existingMatch.status === 'started'
+                    ) {
+                        return send(res, 200, {
+                            status: 'matched',
+                            match: existingMatch
+                        });
+                    }
+
+                    matchedPlayers.delete(username);
+                }
+
                 if (queue.has(username)) {
                     return send(res, 200, {
                         status: 'waiting'
@@ -409,6 +502,10 @@ function createServer() {
 
                     const match = makeMatch(players);
 
+                    for (const player of players) {
+                        matchedPlayers.set(player, match.id);
+                    }
+
                     return send(res, 200, {
                         status: 'matched',
                         match
@@ -425,7 +522,7 @@ function createServer() {
                 method === 'POST' &&
                 path === '/api/matchmaking/leave'
             ) {
-                queue.delete(username);
+                removePlayerFromQueue(username);
 
                 return send(res, 200, {
                     message: 'QUEUE_LEFT'
@@ -471,7 +568,10 @@ function createServer() {
 
                 const body = await readBody(req);
 
-                if (!match.players.includes(body.winner)) {
+                if (
+                    typeof body.winner !== 'string' ||
+                    !match.players.includes(body.winner)
+                ) {
                     return send(res, 400, {
                         error: 'INVALID_WINNER'
                     });
@@ -480,6 +580,12 @@ function createServer() {
                 match.status = 'completed';
                 match.winner = body.winner;
                 match.finishedAt = new Date().toISOString();
+
+                for (const player of match.players) {
+                    if (matchedPlayers.get(player) === match.id) {
+                        matchedPlayers.delete(player);
+                    }
+                }
 
                 return send(res, 200, {
                     message: 'MATCH_COMPLETED',
@@ -492,6 +598,8 @@ function createServer() {
             });
 
         } catch (error) {
+            if (res.destroyed || res.writableEnded) return;
+
             if (error.message === 'BODY_TOO_LARGE') {
                 return send(res, 413, {
                     error: 'BODY_TOO_LARGE'
@@ -504,13 +612,23 @@ function createServer() {
                 });
             }
 
-            console.error(error);
+            if (error.message === 'INVALID_BODY') {
+                return send(res, 400, {
+                    error: 'INVALID_BODY'
+                });
+            }
+
+            console.error('[FF Backend Error]', error);
 
             return send(res, 500, {
                 error: 'INTERNAL_SERVER_ERROR'
             });
         }
     });
+
+    app.keepAliveTimeout = 5000;
+    app.headersTimeout = 10000;
+    app.requestTimeout = 15000;
 
     return app;
 }
@@ -520,9 +638,43 @@ const server = createServer();
 if (require.main === module) {
     const port = Number(process.env.PORT || 3000);
 
+    if (
+        !Number.isInteger(port) ||
+        port < 1 ||
+        port > 65535
+    ) {
+        console.error('Invalid PORT environment variable');
+        process.exit(1);
+    }
+
     server.listen(port, '0.0.0.0', () => {
-        console.log(`FF Backend v3 running on port ${port}`);
+        console.log(
+            `FF Backend v3.1.0 running on port ${port}`
+        );
+        console.log(`Node.js ${process.version}`);
     });
+
+    function shutdown(signal) {
+        console.log(`${signal} received. Closing server...`);
+
+        server.close(error => {
+            if (error) {
+                console.error('Server shutdown error:', error);
+                process.exit(1);
+            }
+
+            console.log('Server stopped.');
+            process.exit(0);
+        });
+
+        setTimeout(() => {
+            console.error('Forced shutdown.');
+            process.exit(1);
+        }, 10000).unref();
+    }
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 module.exports = { createServer };
