@@ -1,0 +1,36 @@
+
+name: FF Private Server - Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify Node.js
+        run: node --version
+
+      - name: Verify npm
+        run: npm --version
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
