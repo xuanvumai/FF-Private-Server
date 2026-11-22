@@ -1,8 +1,10 @@
 
 {
-  "name": "ff-private-server-test",
-  "version": "1.0.0",
+  "name": "ff-private-server",
+  "version": "2.0.0",
   "private": true,
+  "description": "Node.js 24 private backend simulator",
+  "main": "src/server.js",
   "engines": {
     "node": ">=24"
   },
