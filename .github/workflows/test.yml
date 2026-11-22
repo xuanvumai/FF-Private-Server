@@ -1,47 +1,36 @@
 
-name: FF Private Server CI
+name: FF Private Backend CI
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  backend-test:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4.2.2
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Verify repository
-        run: |
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Branch: $GITHUB_REF_NAME"
-          pwd
-          ls -la
-          test -f package.json
+        uses: actions/checkout@v4
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
-      - name: Verify Node.js
-        run: node --version
-
-      - name: Verify npm
-        run: npm --version
+      - name: Verify runtime
+        run: |
+          node --version
+          npm --version
 
       - name: Install dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
 
-      - name: Run backend tests
+      - name: Run integration tests
         run: npm test
