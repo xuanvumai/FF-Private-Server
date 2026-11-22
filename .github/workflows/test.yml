@@ -1,5 +1,5 @@
 
-name: FF Private Backend CI
+name: FF Private Backend V3
 
 on:
   push:
@@ -29,8 +29,8 @@ jobs:
           node --version
           npm --version
 
-      - name: Install dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Validate project
+        run: node --check src/server.js
 
       - name: Run integration tests
         run: npm test
