@@ -4,100 +4,125 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const BODY_LIMIT = 8192;
-const SESSION_BYTES = 32;
-
-function createServer() {
+function createServer(options = {}) {
     const accounts = new Map();
     const sessions = new Map();
     const queue = new Map();
-    const matchedPlayers = new Map();
     const rooms = new Map();
     const matches = new Map();
 
+    const MAX_BODY = 8192;
+    const PORT = Number(options.port || process.env.PORT || 3000);
+
     function send(res, status, data) {
-        if (res.destroyed || res.writableEnded) return;
+        if (res.writableEnded) return;
 
         res.writeHead(status, {
             'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': 'no-store',
-            'X-Content-Type-Options': 'nosniff'
+            'Cache-Control': 'no-store'
         });
 
         res.end(JSON.stringify(data));
     }
 
-    async function readBody(req) {
-        const chunks = [];
-        let size = 0;
-
-        for await (const chunk of req) {
-            size += chunk.length;
-
-            if (size > BODY_LIMIT) {
-                const error = new Error('BODY_TOO_LARGE');
-                error.status = 413;
-                throw error;
-            }
-
-            chunks.push(chunk);
-        }
-
-        if (size === 0) return {};
-
-        let body;
-
-        try {
-            body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        } catch {
-            const error = new Error('INVALID_JSON');
-            error.status = 400;
-            throw error;
-        }
-
-        if (
-            body === null ||
-            typeof body !== 'object' ||
-            Array.isArray(body)
-        ) {
-            const error = new Error('INVALID_BODY');
-            error.status = 400;
-            throw error;
-        }
-
-        return body;
-    }
-
-    function getUser(req) {
-        const header = req.headers.authorization || '';
-
-        if (!header.startsWith('Bearer ')) return null;
-
-        const token = header.slice(7).trim();
-
-        if (!token) return null;
-
-        return sessions.get(token) || null;
+    function createId() {
+        return crypto.randomUUID();
     }
 
     function hashPassword(password, salt) {
         return crypto.scryptSync(password, salt, 64).toString('hex');
     }
 
-    function createSession(username) {
-        const token = crypto.randomBytes(SESSION_BYTES).toString('hex');
-        sessions.set(token, username);
-        return token;
+    function readBody(req) {
+        return new Promise((resolve, reject) => {
+            let body = '';
+            let size = 0;
+
+            req.on('data', chunk => {
+                size += chunk.length;
+
+                if (size > MAX_BODY) {
+                    reject(new Error('BODY_TOO_LARGE'));
+                    req.destroy();
+                    return;
+                }
+
+                body += chunk.toString();
+            });
+
+            req.on('end', () => {
+                if (!body) return resolve({});
+
+                try {
+                    const parsed = JSON.parse(body);
+
+                    if (!parsed || typeof parsed !== 'object' ||
+                        Array.isArray(parsed)) {
+                        return reject(new Error('INVALID_JSON'));
+                    }
+
+                    resolve(parsed);
+                } catch {
+                    reject(new Error('INVALID_JSON'));
+                }
+            });
+
+            req.on('error', reject);
+        });
     }
 
-    function makeMatch(players, roomId = null) {
+    function getUser(req) {
+        const header = req.headers.authorization || '';
+        const token = header.startsWith('Bearer ')
+            ? header.slice(7)
+            : null;
+
+        return token ? sessions.get(token) || null : null;
+    }
+
+    function requireAuth(req, res) {
+        const user = getUser(req);
+
+        if (!user) {
+            send(res, 401, {
+                success: false,
+                error: 'UNAUTHORIZED'
+            });
+            return null;
+        }
+
+        return user;
+    }
+
+    function publicUser(user) {
+        return {
+            id: user.id,
+            username: user.username
+        };
+    }
+
+    function roomInfo(room) {
+        return {
+            id: room.id,
+            name: room.name,
+            owner: room.owner,
+            players: room.players,
+            maxPlayers: room.maxPlayers,
+            status: room.status
+        };
+    }
+
+    function removeFromQueue(userId) {
+        queue.delete(userId);
+    }
+
+    function createMatch(players, roomId = null) {
         const match = {
-            id: crypto.randomUUID(),
-            roomId,
+            id: createId(),
             players: [...players],
-            status: 'started',
-            winner: null,
-            createdAt: new Date().toISOString(),
+            roomId,
+            status: 'active',
+            createdAt: Date.now(),
             finishedAt: null
         };
 
@@ -106,575 +131,465 @@ function createServer() {
         return match;
     }
 
-    function removePlayerFromQueue(username) {
-        queue.delete(username);
-        matchedPlayers.delete(username);
-    }
-
-    const app = http.createServer(async (req, res) => {
-        let path;
+    async function handler(req, res) {
+        let url;
 
         try {
-            const url = new URL(
-                req.url || '/',
-                'http://localhost'
-            );
+            url = new URL(req.url, 'http://localhost');
+        } catch {
+            return send(res, 400, {
+                success: false,
+                error: 'INVALID_URL'
+            });
+        }
 
-            path = url.pathname;
+        const path = url.pathname;
+        const method = req.method;
 
-            const method = req.method || 'GET';
-
+        try {
             // ROOT
-            if (method === 'GET' && path === '/') {
+            if (path === '/' && method === 'GET') {
                 return send(res, 200, {
                     name: 'FF Private Backend',
-                    version: '3.1.0',
-                    status: 'online'
+                    version: '3.2.0',
+                    status: 'online',
+                    runtime: 'Node.js 24'
                 });
             }
 
             // HEALTH
-            if (method === 'GET' && path === '/health') {
+            if (path === '/health' && method === 'GET') {
                 return send(res, 200, {
-                    status: 'online',
-                    version: '3.1.0',
-                    node: process.version,
-                    modules: [
-                        'account',
-                        'lobby',
-                        'matchmaking',
-                        'rooms',
-                        'matches'
-                    ]
+                    success: true,
+                    status: 'healthy',
+                    uptime: process.uptime()
                 });
             }
 
             // REGISTER
-            if (method === 'POST' && path === '/api/register') {
+            if (path === '/api/register' && method === 'POST') {
                 const body = await readBody(req);
-
-                const username = String(body.username || '')
-                    .trim()
-                    .toLowerCase();
-
-                if (!/^[a-z0-9_]{3,20}$/.test(username)) {
-                    return send(res, 400, {
-                        error: 'INVALID_USERNAME'
-                    });
-                }
+                const username = body.username;
+                const password = body.password;
 
                 if (
-                    typeof body.password !== 'string' ||
-                    body.password.length < 8 ||
-                    body.password.length > 128
+                    typeof username !== 'string' ||
+                    typeof password !== 'string' ||
+                    username.length < 3 ||
+                    username.length > 24 ||
+                    password.length < 6 ||
+                    password.length > 128
                 ) {
                     return send(res, 400, {
-                        error: 'INVALID_PASSWORD'
+                        success: false,
+                        error: 'INVALID_CREDENTIALS'
                     });
                 }
 
                 if (accounts.has(username)) {
                     return send(res, 409, {
-                        error: 'ACCOUNT_EXISTS'
+                        success: false,
+                        error: 'USERNAME_EXISTS'
                     });
                 }
 
                 const salt = crypto.randomBytes(16).toString('hex');
 
-                accounts.set(username, {
+                const user = {
+                    id: createId(),
                     username,
                     salt,
-                    passwordHash: hashPassword(body.password, salt),
-                    createdAt: new Date().toISOString()
-                });
+                    passwordHash: hashPassword(password, salt),
+                    createdAt: Date.now()
+                };
+
+                accounts.set(username, user);
 
                 return send(res, 201, {
-                    message: 'ACCOUNT_CREATED',
-                    token: createSession(username),
-                    user: { username }
+                    success: true,
+                    user: publicUser(user)
                 });
             }
 
             // LOGIN
-            if (method === 'POST' && path === '/api/login') {
+            if (path === '/api/login' && method === 'POST') {
                 const body = await readBody(req);
+                const { username, password } = body;
 
-                const username = String(body.username || '')
-                    .trim()
-                    .toLowerCase();
-
-                const account = accounts.get(username);
+                const user = accounts.get(username);
 
                 if (
-                    !account ||
-                    typeof body.password !== 'string' ||
-                    body.password.length < 8 ||
-                    body.password.length > 128
+                    !user ||
+                    typeof password !== 'string' ||
+                    hashPassword(password, user.salt) !== user.passwordHash
                 ) {
                     return send(res, 401, {
-                        error: 'INVALID_CREDENTIALS'
+                        success: false,
+                        error: 'INVALID_LOGIN'
                     });
                 }
 
-                const actual = Buffer.from(
-                    hashPassword(body.password, account.salt),
-                    'hex'
-                );
+                const token = crypto.randomBytes(32).toString('hex');
 
-                const expected = Buffer.from(
-                    account.passwordHash,
-                    'hex'
-                );
-
-                if (
-                    actual.length !== expected.length ||
-                    !crypto.timingSafeEqual(actual, expected)
-                ) {
-                    return send(res, 401, {
-                        error: 'INVALID_CREDENTIALS'
-                    });
-                }
+                sessions.set(token, user);
 
                 return send(res, 200, {
-                    message: 'LOGIN_SUCCESS',
-                    token: createSession(username),
-                    user: { username }
+                    success: true,
+                    token,
+                    user: publicUser(user)
                 });
             }
 
-            // AUTHENTICATION
-            const username = getUser(req);
-
-            if (!username) {
-                return send(res, 401, {
-                    error: 'UNAUTHORIZED'
-                });
+            // AUTHENTICATED ROUTES
+            if (path.startsWith('/api/')) {
+                const user = requireAuth(req, res);
+                if (!user) return;
             }
 
-            // PROFILE
-            if (method === 'GET' && path === '/api/me') {
-                const account = accounts.get(username);
+            const user = path.startsWith('/api/')
+                ? getUser(req)
+                : null;
 
-                if (!account) {
-                    return send(res, 404, {
-                        error: 'ACCOUNT_NOT_FOUND'
-                    });
-                }
-
+            // ME
+            if (path === '/api/me' && method === 'GET') {
                 return send(res, 200, {
-                    username,
-                    createdAt: account.createdAt
+                    success: true,
+                    user: publicUser(user)
                 });
             }
 
             // LOGOUT
-            if (method === 'POST' && path === '/api/logout') {
-                const token = req.headers.authorization.slice(7).trim();
-
+            if (path === '/api/logout' && method === 'POST') {
+                const token = (req.headers.authorization || '').slice(7);
                 sessions.delete(token);
-                removePlayerFromQueue(username);
-
-                for (const room of rooms.values()) {
-                    if (!room.players.includes(username)) continue;
-
-                    if (room.host === username) {
-                        room.status = 'closed';
-                        room.players = [];
-                    } else {
-                        room.players = room.players.filter(
-                            player => player !== username
-                        );
-                    }
-                }
+                removeFromQueue(user.id);
 
                 return send(res, 200, {
-                    message: 'LOGOUT_SUCCESS'
+                    success: true,
+                    message: 'Logged out'
                 });
             }
 
             // LOBBY
-            if (method === 'GET' && path === '/api/lobby') {
-                const online = [...new Set(sessions.values())];
-
+            if (path === '/api/lobby' && method === 'GET') {
                 return send(res, 200, {
-                    onlineCount: online.length,
-                    players: online.map(name => ({
-                        username: name
-                    }))
+                    success: true,
+                    onlinePlayers: sessions.size,
+                    waitingPlayers: queue.size,
+                    rooms: [...rooms.values()].map(roomInfo)
+                });
+            }
+
+            // ROOMS LIST
+            if (path === '/api/rooms' && method === 'GET') {
+                return send(res, 200, {
+                    success: true,
+                    rooms: [...rooms.values()].map(roomInfo)
                 });
             }
 
             // CREATE ROOM
-            if (method === 'POST' && path === '/api/rooms') {
+            if (path === '/api/rooms' && method === 'POST') {
                 const body = await readBody(req);
-                const name = String(body.name || '').trim();
 
-                const maxPlayers = body.maxPlayers === undefined
-                    ? 2
-                    : Number(body.maxPlayers);
+                const name = typeof body.name === 'string'
+                    ? body.name.trim()
+                    : 'Private Room';
 
-                if (name.length < 3 || name.length > 30) {
-                    return send(res, 400, {
-                        error: 'INVALID_ROOM_NAME'
-                    });
-                }
+                const maxPlayers = Number(body.maxPlayers || 4);
 
                 if (
+                    name.length < 1 ||
+                    name.length > 40 ||
                     !Number.isInteger(maxPlayers) ||
                     maxPlayers < 2 ||
-                    maxPlayers > 4
+                    maxPlayers > 10
                 ) {
                     return send(res, 400, {
-                        error: 'INVALID_PLAYER_LIMIT'
+                        success: false,
+                        error: 'INVALID_ROOM'
                     });
                 }
 
                 const room = {
-                    id: crypto.randomUUID(),
+                    id: createId(),
                     name,
-                    host: username,
-                    players: [username],
+                    owner: user.id,
+                    players: [user.id],
                     maxPlayers,
                     status: 'waiting',
-                    createdAt: new Date().toISOString(),
-                    matchId: null
+                    createdAt: Date.now()
                 };
 
                 rooms.set(room.id, room);
 
                 return send(res, 201, {
-                    message: 'ROOM_CREATED',
-                    room
+                    success: true,
+                    room: roomInfo(room)
                 });
             }
 
-            // LIST ROOMS
-            if (method === 'GET' && path === '/api/rooms') {
-                return send(res, 200, {
-                    rooms: [...rooms.values()]
-                        .filter(room => room.status !== 'closed')
-                });
-            }
-
-            // JOIN ROOM
-            const joinRoom = path.match(
-                /^\/api\/rooms\/([a-f0-9-]+)\/join$/
+            // ROOM ACTIONS
+            const roomAction = path.match(
+                /^\/api\/rooms\/([^/]+)\/(join|leave|start)$/
             );
 
-            if (method === 'POST' && joinRoom) {
-                const room = rooms.get(joinRoom[1]);
+            if (roomAction) {
+                const [, roomId, action] = roomAction;
+                const room = rooms.get(roomId);
 
-                if (!room || room.status === 'closed') {
+                if (!room) {
                     return send(res, 404, {
+                        success: false,
                         error: 'ROOM_NOT_FOUND'
                     });
                 }
 
-                if (room.status !== 'waiting') {
-                    return send(res, 409, {
-                        error: 'ROOM_ALREADY_STARTED'
+                if (action === 'join' && method === 'POST') {
+                    if (room.status !== 'waiting') {
+                        return send(res, 409, {
+                            success: false,
+                            error: 'ROOM_NOT_WAITING'
+                        });
+                    }
+
+                    if (room.players.includes(user.id)) {
+                        return send(res, 200, {
+                            success: true,
+                            room: roomInfo(room)
+                        });
+                    }
+
+                    if (room.players.length >= room.maxPlayers) {
+                        return send(res, 409, {
+                            success: false,
+                            error: 'ROOM_FULL'
+                        });
+                    }
+
+                    room.players.push(user.id);
+
+                    return send(res, 200, {
+                        success: true,
+                        room: roomInfo(room)
                     });
                 }
 
-                if (room.players.includes(username)) {
-                    return send(res, 200, { room });
-                }
-
-                if (room.players.length >= room.maxPlayers) {
-                    return send(res, 409, {
-                        error: 'ROOM_FULL'
-                    });
-                }
-
-                room.players.push(username);
-
-                return send(res, 200, {
-                    message: 'ROOM_JOINED',
-                    room
-                });
-            }
-
-            // LEAVE ROOM
-            const leaveRoom = path.match(
-                /^\/api\/rooms\/([a-f0-9-]+)\/leave$/
-            );
-
-            if (method === 'POST' && leaveRoom) {
-                const room = rooms.get(leaveRoom[1]);
-
-                if (!room || !room.players.includes(username)) {
-                    return send(res, 404, {
-                        error: 'ROOM_NOT_FOUND'
-                    });
-                }
-
-                if (room.host === username) {
-                    room.status = 'closed';
-                    room.players = [];
-                } else {
+                if (action === 'leave' && method === 'POST') {
                     room.players = room.players.filter(
-                        player => player !== username
+                        id => id !== user.id
                     );
-                }
 
-                return send(res, 200, {
-                    message: 'ROOM_LEFT'
-                });
-            }
+                    if (room.players.length === 0) {
+                        rooms.delete(roomId);
+                    } else if (room.owner === user.id) {
+                        room.owner = room.players[0];
+                    }
 
-            // START ROOM MATCH
-            const startRoom = path.match(
-                /^\/api\/rooms\/([a-f0-9-]+)\/start$/
-            );
-
-            if (method === 'POST' && startRoom) {
-                const room = rooms.get(startRoom[1]);
-
-                if (!room || room.status !== 'waiting') {
-                    return send(res, 404, {
-                        error: 'ROOM_NOT_AVAILABLE'
+                    return send(res, 200, {
+                        success: true
                     });
                 }
 
-                if (room.host !== username) {
-                    return send(res, 403, {
-                        error: 'HOST_ONLY'
+                if (action === 'start' && method === 'POST') {
+                    if (room.owner !== user.id) {
+                        return send(res, 403, {
+                            success: false,
+                            error: 'NOT_ROOM_OWNER'
+                        });
+                    }
+
+                    if (room.status !== 'waiting') {
+                        return send(res, 409, {
+                            success: false,
+                            error: 'ROOM_ALREADY_STARTED'
+                        });
+                    }
+
+                    room.status = 'active';
+
+                    const match = createMatch(
+                        room.players,
+                        room.id
+                    );
+
+                    return send(res, 200, {
+                        success: true,
+                        match
                     });
                 }
-
-                if (room.players.length < 2) {
-                    return send(res, 409, {
-                        error: 'NOT_ENOUGH_PLAYERS'
-                    });
-                }
-
-                const match = makeMatch(
-                    room.players,
-                    room.id
-                );
-
-                room.status = 'started';
-                room.matchId = match.id;
-
-                return send(res, 200, {
-                    message: 'MATCH_STARTED',
-                    match
-                });
             }
 
             // MATCHMAKING JOIN
             if (
-                method === 'POST' &&
-                path === '/api/matchmaking/join'
+                path === '/api/matchmaking/join' &&
+                method === 'POST'
             ) {
-                const existingMatchId = matchedPlayers.get(username);
-
-                if (existingMatchId) {
-                    const existingMatch = matches.get(existingMatchId);
-
-                    if (
-                        existingMatch &&
-                        existingMatch.status === 'started'
-                    ) {
-                        return send(res, 200, {
-                            status: 'matched',
-                            match: existingMatch
-                        });
-                    }
-
-                    matchedPlayers.delete(username);
-                }
-
-                if (queue.has(username)) {
+                if (queue.has(user.id)) {
                     return send(res, 200, {
+                        success: true,
                         status: 'waiting'
                     });
                 }
 
-                queue.set(username, Date.now());
+                queue.set(user.id, {
+                    userId: user.id,
+                    joinedAt: Date.now()
+                });
 
-                if (queue.size >= 2) {
-                    const players = [...queue.keys()].slice(0, 2);
+                const players = [...queue.keys()];
 
-                    for (const player of players) {
-                        queue.delete(player);
+                if (players.length >= 2) {
+                    const matchedPlayers = players.slice(0, 2);
+
+                    for (const id of matchedPlayers) {
+                        queue.delete(id);
                     }
 
-                    const match = makeMatch(players);
-
-                    for (const player of players) {
-                        matchedPlayers.set(player, match.id);
-                    }
+                    const match = createMatch(matchedPlayers);
 
                     return send(res, 200, {
+                        success: true,
                         status: 'matched',
+                        matchedPlayers,
                         match
                     });
                 }
 
                 return send(res, 200, {
+                    success: true,
                     status: 'waiting'
                 });
             }
 
             // MATCHMAKING LEAVE
             if (
-                method === 'POST' &&
-                path === '/api/matchmaking/leave'
+                path === '/api/matchmaking/leave' &&
+                method === 'POST'
             ) {
-                removePlayerFromQueue(username);
+                removeFromQueue(user.id);
 
                 return send(res, 200, {
-                    message: 'QUEUE_LEFT'
+                    success: true,
+                    status: 'left'
                 });
             }
 
             // MATCH DETAILS
             const matchRoute = path.match(
-                /^\/api\/matches\/([a-f0-9-]+)$/
+                /^\/api\/matches\/([^/]+)$/
             );
 
-            if (method === 'GET' && matchRoute) {
+            if (matchRoute && method === 'GET') {
                 const match = matches.get(matchRoute[1]);
 
-                if (!match || !match.players.includes(username)) {
+                if (!match) {
                     return send(res, 404, {
+                        success: false,
                         error: 'MATCH_NOT_FOUND'
                     });
                 }
 
-                return send(res, 200, { match });
+                if (!match.players.includes(user.id)) {
+                    return send(res, 403, {
+                        success: false,
+                        error: 'NOT_MATCH_PLAYER'
+                    });
+                }
+
+                return send(res, 200, {
+                    success: true,
+                    match
+                });
             }
 
             // FINISH MATCH
-            const finishMatch = path.match(
-                /^\/api\/matches\/([a-f0-9-]+)\/finish$/
+            const finishRoute = path.match(
+                /^\/api\/matches\/([^/]+)\/finish$/
             );
 
-            if (method === 'POST' && finishMatch) {
-                const match = matches.get(finishMatch[1]);
+            if (finishRoute && method === 'POST') {
+                const match = matches.get(finishRoute[1]);
 
-                if (!match || !match.players.includes(username)) {
+                if (!match) {
                     return send(res, 404, {
+                        success: false,
                         error: 'MATCH_NOT_FOUND'
                     });
                 }
 
-                if (match.status === 'completed') {
+                if (!match.players.includes(user.id)) {
+                    return send(res, 403, {
+                        success: false,
+                        error: 'NOT_MATCH_PLAYER'
+                    });
+                }
+
+                if (match.status === 'finished') {
                     return send(res, 409, {
+                        success: false,
                         error: 'MATCH_ALREADY_FINISHED'
                     });
                 }
 
-                const body = await readBody(req);
-
-                if (
-                    typeof body.winner !== 'string' ||
-                    !match.players.includes(body.winner)
-                ) {
-                    return send(res, 400, {
-                        error: 'INVALID_WINNER'
-                    });
-                }
-
-                match.status = 'completed';
-                match.winner = body.winner;
-                match.finishedAt = new Date().toISOString();
-
-                for (const player of match.players) {
-                    if (matchedPlayers.get(player) === match.id) {
-                        matchedPlayers.delete(player);
-                    }
-                }
+                match.status = 'finished';
+                match.finishedAt = Date.now();
 
                 return send(res, 200, {
-                    message: 'MATCH_COMPLETED',
+                    success: true,
                     match
                 });
             }
 
             return send(res, 404, {
+                success: false,
                 error: 'NOT_FOUND'
             });
 
         } catch (error) {
-            if (res.destroyed || res.writableEnded) return;
+            if (!res.writableEnded && !res.destroyed) {
+                const status = error.message === 'BODY_TOO_LARGE'
+                    ? 413
+                    : error.message === 'INVALID_JSON'
+                        ? 400
+                        : 500;
 
-            if (error.message === 'BODY_TOO_LARGE') {
-                return send(res, 413, {
-                    error: 'BODY_TOO_LARGE'
+                send(res, status, {
+                    success: false,
+                    error: status === 500
+                        ? 'INTERNAL_SERVER_ERROR'
+                        : error.message
                 });
             }
-
-            if (error.message === 'INVALID_JSON') {
-                return send(res, 400, {
-                    error: 'INVALID_JSON'
-                });
-            }
-
-            if (error.message === 'INVALID_BODY') {
-                return send(res, 400, {
-                    error: 'INVALID_BODY'
-                });
-            }
-
-            console.error('[FF Backend Error]', error);
-
-            return send(res, 500, {
-                error: 'INTERNAL_SERVER_ERROR'
-            });
         }
-    });
+    }
 
-    app.keepAliveTimeout = 5000;
-    app.headersTimeout = 10000;
-    app.requestTimeout = 15000;
+    const server = http.createServer(handler);
 
-    return app;
+    server.requestTimeout = 30000;
+    server.headersTimeout = 15000;
+    server.keepAliveTimeout = 5000;
+
+    return server;
 }
 
-const server = createServer();
-
 if (require.main === module) {
-    const port = Number(process.env.PORT || 3000);
+    const server = createServer();
 
-    if (
-        !Number.isInteger(port) ||
-        port < 1 ||
-        port > 65535
-    ) {
-        console.error('Invalid PORT environment variable');
-        process.exit(1);
-    }
+    const PORT = Number(process.env.PORT || 3000);
 
-    server.listen(port, '0.0.0.0', () => {
-        console.log(
-            `FF Backend v3.1.0 running on port ${port}`
-        );
-        console.log(`Node.js ${process.version}`);
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`FF Private Backend running on port ${PORT}`);
     });
 
-    function shutdown(signal) {
-        console.log(`${signal} received. Closing server...`);
-
-        server.close(error => {
-            if (error) {
-                console.error('Server shutdown error:', error);
-                process.exit(1);
-            }
-
-            console.log('Server stopped.');
+    function shutdown() {
+        server.close(() => {
             process.exit(0);
         });
-
-        setTimeout(() => {
-            console.error('Forced shutdown.');
-            process.exit(1);
-        }, 10000).unref();
     }
 
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
 }
 
 module.exports = { createServer };
